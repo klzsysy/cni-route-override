@@ -20,14 +20,13 @@ spec:
         tier: node
         app: route-override
     spec:
-      nodeSelector:
-        beta.kubernetes.io/arch: amd64
       tolerations:
         - operator: Exists
           effect: NoSchedule
       containers:
         - name: route-override
-          image: ghcr.io/redhat-nfvpe/cni-route-override:latest
+          image: registry.smtx.io/kubesmart-dev/route-override
+          imagePullPolicy: Always
           command: ["/bin/sh"]
           args:
             - "-c"

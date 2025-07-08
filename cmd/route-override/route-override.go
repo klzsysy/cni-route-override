@@ -21,17 +21,30 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net"
-	"os"
-
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
 	"github.com/containernetworking/plugins/pkg/ns"
-
+	log "github.com/k8snetworkplumbingwg/cni-log"
 	"github.com/vishvananda/netlink"
+	"net"
+	"slices"
+	"sort"
 )
+
+func init() {
+	log.SetLogFile("/var/log/cni-route-override.log")
+}
+
+const (
+	ipv4DefaultRoute = "0.0.0.0/0"
+	ipv6DefaultRoute = "::/0"
+	defaultInf       = "eth0"
+)
+
+var extInf []string
+var infNames []string
 
 // Todo:
 // + only checko route/dst
@@ -41,13 +54,14 @@ import (
 type RouteOverrideConfig struct {
 	types.NetConf
 
-	PrevResult *current.Result `json:"-"`
-
-	FlushRoutes  bool           `json:"flushroutes,omitempty"`
-	FlushGateway bool           `json:"flushgateway,omitempty"`
-	DelRoutes    []*types.Route `json:"delroutes"`
-	AddRoutes    []*types.Route `json:"addroutes"`
-	SkipCheck    bool           `json:"skipcheck,omitempty"`
+	PrevResult   *current.Result `json:"-"`
+	Debug        bool            `json:"debug,omitempty"`
+	ExtInf       []string        `json:"extInf,omitempty"`
+	FlushRoutes  bool            `json:"flushroutes,omitempty"`
+	FlushGateway bool            `json:"flushgateway,omitempty"`
+	DelRoutes    []*types.Route  `json:"delroutes"`
+	AddRoutes    []*types.Route  `json:"addroutes"`
+	SkipCheck    bool            `json:"skipcheck,omitempty"`
 
 	Args *struct {
 		A *IPAMArgs `json:"cni"`
@@ -56,6 +70,7 @@ type RouteOverrideConfig struct {
 
 // IPAMArgs represents CNI argument conventions for the plugin
 type IPAMArgs struct {
+	Debug        bool           `json:"debug,omitempty"`
 	FlushRoutes  *bool          `json:"flushroutes,omitempty"`
 	FlushGateway *bool          `json:"flushgateway,omitempty"`
 	DelRoutes    []*types.Route `json:"delroutes,omitempty"`
@@ -69,14 +84,16 @@ type IPAMArgs struct {
 	}
 */
 func parseConf(data []byte, _ string) (*RouteOverrideConfig, error) {
+	log.Debugf("Parsing configuration: %s", string(data))
 	conf := RouteOverrideConfig{FlushRoutes: false}
 
 	if err := json.Unmarshal(data, &conf); err != nil {
-		return nil, fmt.Errorf("failed to load netconf: %v", err)
+		return nil, fmt.Errorf("failed to load netconf: %v\n%s", err, string(data))
 	}
 
 	// override values by args
 	if conf.Args != nil {
+		log.Infof("Loading args: %v", conf.Args)
 		if conf.Args.A.FlushRoutes != nil {
 			conf.FlushRoutes = *conf.Args.A.FlushRoutes
 		}
@@ -96,7 +113,19 @@ func parseConf(data []byte, _ string) (*RouteOverrideConfig, error) {
 		if conf.Args.A.SkipCheck != nil {
 			conf.SkipCheck = *conf.Args.A.SkipCheck
 		}
+		if conf.Args.A.Debug {
+			conf.Debug = true
+		}
+	}
+	if conf.Debug {
+		log.SetLogLevel(log.DebugLevel)
+	}
+	body, _ := json.Marshal(conf)
+	log.Debugf("parsed configuration: %s", string(body))
 
+	if conf.ExtInf != nil {
+		log.Debugf("Extension processing interface: %s", conf.ExtInf)
+		extInf = conf.ExtInf
 	}
 
 	// Parse previous result
@@ -118,106 +147,162 @@ func parseConf(data []byte, _ string) (*RouteOverrideConfig, error) {
 			return nil, fmt.Errorf("could not convert result to current version: %v", err)
 		}
 	}
-
 	return &conf, nil
 }
 
-func deleteAllRoutes(res *current.Result) error {
-	var err error
-	for _, netif := range res.Interfaces {
-		if netif.Sandbox != "" {
-			link, _ := netlink.LinkByName(netif.Name)
-			routes, _ := netlink.RouteList(link, netlink.FAMILY_ALL)
-			for _, route := range routes {
-				if route.Scope != netlink.SCOPE_LINK {
-					if route.Dst != nil {
-						if route.Dst.IP.IsLinkLocalUnicast() != true && route.Gw != nil {
-							err = netlink.RouteDel(&route)
+func deleteAllRoutes(res *current.Result) {
+	log.Debugf("delete all routes")
+	for _, netif := range ifNames(res) {
+		link, err := netlink.LinkByName(netif)
+		if err != nil {
+			continue
+		}
+		routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			log.Warningf("failed to list routes %s: %v", netif, err)
+			continue
+		}
+		for _, route := range routes {
+			if route.Scope != netlink.SCOPE_LINK {
+				if route.Dst != nil {
+					if route.Dst.IP.IsLinkLocalUnicast() != true && route.Gw != nil {
+						if err := netlink.RouteDel(&route); err != nil {
+							log.Errorf("failed to delete route %s: %v", netif, route)
+						} else {
+							log.Infof("deleted route %s", route)
 						}
+					}
+				} else {
+					if err := netlink.RouteDel(&route); err != nil {
+						log.Errorf("failed to delete route %s: %v", netif, err)
 					} else {
-						err = netlink.RouteDel(&route)
+						log.Infof("deleted default route %s", route)
 					}
 				}
 			}
 		}
 	}
-
-	return err
 }
 
-func deleteGWRoute(res *current.Result) error {
-	var err error
-	// fallback to eth0 if there is no interface in result
-	if res.Interfaces == nil {
-		link, _ := netlink.LinkByName("eth0")
-		routes, _ := netlink.RouteList(link, netlink.FAMILY_ALL)
-		for _, nlroute := range routes {
-			if nlroute.Dst == nil {
-				err = netlink.RouteDel(&nlroute)
-			}
+func deleteGWRoute(res *current.Result) {
+	log.Infof("deleting default route")
+	for _, netif := range ifNames(res) {
+		link, err := netlink.LinkByName(netif)
+		if err != nil {
+			continue
 		}
-	} else {
-		for _, netif := range res.Interfaces {
-			if netif.Sandbox != "" {
-				link, _ := netlink.LinkByName(netif.Name)
-				routes, _ := netlink.RouteList(link, netlink.FAMILY_ALL)
-				for _, nlroute := range routes {
-					if nlroute.Dst == nil {
-						err = netlink.RouteDel(&nlroute)
-					}
+		routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			log.Errorf("failed to list routes %s: %v", netif, err)
+			continue
+		}
+		for _, nlroute := range routes {
+			// default route dst is nul.
+			if nlroute.Dst == nil {
+				if err := netlink.RouteDel(&nlroute); err != nil {
+					log.Errorf("failed to delete route %s: %v", netif, err)
+				} else {
+					log.Debugf("deleted defaut route %s", nlroute)
 				}
 			}
 		}
 	}
+}
 
-	return err
+func ifNames(res *current.Result) (infs []string) {
+	if infNames != nil {
+		return infNames
+	}
+	defer func() {
+		infNames = infs
+		log.Debugf("interface names: %s", infNames)
+	}()
+	if res.Interfaces != nil {
+		for _, netif := range res.Interfaces {
+			if netif.Sandbox != "" {
+				infs = append(infs, netif.Name)
+			}
+		}
+	}
+	infs = append(infs, extInf...)
+	if len(infs) == 0 {
+		return []string{defaultInf}
+	}
+	if len(infs) == 1 {
+		return infs
+	}
+	sort.SliceStable(infs, func(i, j int) bool { return infs[i] < infs[j] })
+	slices.Compact(infs)
+	return infs
 }
 
 func deleteRoute(route *types.Route, res *current.Result) error {
-	var err error
-	// fallback to eth0 if there is no interface in result
-	if res.Interfaces == nil {
-		link, _ := netlink.LinkByName("eth0")
-		routes, _ := netlink.RouteList(link, netlink.FAMILY_ALL)
-		for _, nlroute := range routes {
-			if nlroute.Dst != nil &&
-				nlroute.Dst.IP.Equal(route.Dst.IP) &&
-				nlroute.Dst.Mask.String() == route.Dst.Mask.String() {
-				err = netlink.RouteDel(&nlroute)
-			}
+	var (
+		err    error
+		link   netlink.Link
+		routes []netlink.Route
+	)
+	for _, inf := range ifNames(res) {
+		log.Debugf("try deleting route %s by %s", route, inf)
+		link, err = netlink.LinkByName(inf)
+		if err != nil {
+			log.Warningf("failed to link by name %s: %v", inf, err)
+			continue
 		}
-	} else {
-		for _, netif := range res.Interfaces {
-			if netif.Sandbox != "" {
-				link, _ := netlink.LinkByName(netif.Name)
-				routes, _ := netlink.RouteList(link, netlink.FAMILY_ALL)
-				for _, nlroute := range routes {
-					if nlroute.Dst != nil &&
-						nlroute.Dst.IP.Equal(route.Dst.IP) &&
-						nlroute.Dst.Mask.String() == route.Dst.Mask.String() {
-						err = netlink.RouteDel(&nlroute)
-					}
+		routes, err = netlink.RouteList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			log.Errorf("failed to list routes %s: %v", inf, err)
+			continue
+		}
+		for _, nlroute := range routes {
+			if (nlroute.Dst == nil && (route.Dst.String() == ipv4DefaultRoute || route.Dst.String() == ipv6DefaultRoute)) || nlroute.Dst.String() == route.Dst.String() {
+				if route.GW != nil && !nlroute.Gw.Equal(route.GW) {
+					log.Debugf("skip delete route, because the gateway does not match: %s", nlroute)
+					continue
 				}
+				if err = netlink.RouteDel(&nlroute); err != nil {
+					log.Errorf("failed to delete route %s: %v", inf, err)
+				} else {
+					log.Infof("deleted route %s %s", inf, nlroute)
+					return nil
+				}
+			} else {
+				log.Debugf("skip delete route %s by %s, except %s", nlroute.Dst.String(), inf, route.Dst.String())
 			}
 		}
 	}
-
 	return err
 }
 
-func addRoute(dev netlink.Link, route *types.Route) error {
-	return netlink.RouteAdd(&netlink.Route{
-		LinkIndex: dev.Attrs().Index,
-		Scope:     netlink.SCOPE_UNIVERSE,
-		Dst:       &route.Dst,
-		Gw:        route.GW,
-	})
+func addRoute(route *types.Route, result *current.Result) error {
+	var (
+		err   error
+		netif netlink.Link
+	)
+	for _, inf := range ifNames(result) {
+		netif, err = netlink.LinkByName(inf)
+		if err != nil {
+			log.Errorf("failed to link by name %s: %v", inf, err)
+			continue
+		}
+		err = netlink.RouteAdd(&netlink.Route{
+			LinkIndex: netif.Attrs().Index,
+			Scope:     netlink.SCOPE_UNIVERSE,
+			Dst:       &route.Dst,
+			Gw:        route.GW,
+		})
+		if err == nil {
+			log.Infof("added route %v by %s", route, inf)
+			return nil
+		}
+	}
+	return err
 }
 
 func processRoutes(netnsname string, conf *RouteOverrideConfig) (*current.Result, error) {
 	netns, err := ns.GetNS(netnsname)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open netns %q: %v", netns, err)
+		return nil, fmt.Errorf("failed to get netns %s: %v", netnsname, err)
 	}
 	defer netns.Close()
 
@@ -228,9 +313,9 @@ func processRoutes(netnsname string, conf *RouteOverrideConfig) (*current.Result
 
 	if conf.FlushGateway {
 		// add "0.0.0.0/0" into delRoute to remove it from routing table/result
-		_, gwRoute, _ := net.ParseCIDR("0.0.0.0/0")
+		_, gwRoute, _ := net.ParseCIDR(ipv4DefaultRoute)
 		conf.DelRoutes = append(conf.DelRoutes, &types.Route{Dst: *gwRoute})
-		_, gwRoute, _ = net.ParseCIDR("::/0")
+		_, gwRoute, _ = net.ParseCIDR(ipv6DefaultRoute)
 		conf.DelRoutes = append(conf.DelRoutes, &types.Route{Dst: *gwRoute})
 
 		// delete given gateway address
@@ -243,58 +328,50 @@ func processRoutes(netnsname string, conf *RouteOverrideConfig) (*current.Result
 		}
 	}
 
-	newRoutes := []*types.Route{}
-	err = netns.Do(func(_ ns.NetNS) error {
+	newRoutes := map[string]*types.Route{}
+	if err = netns.Do(func(_ ns.NetNS) error {
 		// Flush route if required
 		if !conf.FlushRoutes {
-		NEXT:
-			for _, route := range res.Routes {
-				for _, delroute := range conf.DelRoutes {
+			for _, delroute := range conf.DelRoutes {
+				if err = deleteRoute(delroute, res); err != nil {
+					return err
+				}
+				for _, route := range res.Routes {
 					if route.Dst.IP.Equal(delroute.Dst.IP) &&
 						bytes.Equal(route.Dst.Mask, delroute.Dst.Mask) {
-						err = deleteRoute(delroute, res)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "failed to delete route %v: %v", delroute, err)
-						}
-						continue NEXT
+						continue
 					}
-
+					newRoutes[route.String()] = route
 				}
-				newRoutes = append(newRoutes, route)
 			}
 		} else {
 			deleteAllRoutes(res)
 		}
 
-		if conf.FlushGateway {
+		if conf.FlushGateway && !conf.FlushRoutes {
 			deleteGWRoute(res)
 		}
-
-		// Get container IF name
-		var containerIFName string
-		for _, i := range res.Interfaces {
-			if i.Sandbox != "" {
-				containerIFName = i.Name
-				break
-			}
-		}
 		// Add route
-		dev, _ := netlink.LinkByName(containerIFName)
 		for _, route := range conf.AddRoutes {
-			newRoutes = append(newRoutes, route)
-			if err := addRoute(dev, route); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to add route: %v: %v", route, err)
+			if err = addRoute(route, res); err != nil {
+				return log.Errorf("failed to add route %+v: %v", route, err)
 			}
+			newRoutes[route.String()] = route
 		}
-
 		return nil
-	})
-	res.Routes = newRoutes
-
+	}); err != nil {
+		return nil, err
+	}
+	var r []*types.Route
+	for _, route := range newRoutes {
+		r = append(r, route)
+	}
+	res.Routes = r
 	return res, nil
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
+	log.Infof("ADD: [args:%s],[netns:%s],[ifName:%s],[containerID:%s]", args.Args, args.Netns, args.IfName, args.ContainerID)
 	overrideConf, err := parseConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
@@ -316,6 +393,7 @@ func cmdDel(_ *skel.CmdArgs) error {
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
+	log.Infof("CHECK: [args:%s],[netns:%s],[ifName:%s],[containerID:%s]", args.Args, args.Netns, args.IfName, args.ContainerID)
 	// Parse previous result
 	overrideConf, err := parseConf(args.StdinData, args.Args)
 
@@ -405,6 +483,5 @@ func cmdCheck(args *skel.CmdArgs) error {
 }
 
 func main() {
-	// TODO: implement plugin version
-	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.All, "TODO")
+	skel.PluginMainFuncs(skel.CNIFuncs{Add: cmdAdd, Check: cmdCheck, Del: cmdDel}, version.All, "route-override v1.0.0-dev")
 }

@@ -20,6 +20,7 @@ import (
 	//"fmt"
 	//"os"
 	"net"
+	"reflect"
 	"testing"
 
 	"github.com/containernetworking/cni/pkg/skel"

@@ -78,4 +78,6 @@ The following [args conventions](https://github.com/containernetworking/cni/blob
 * `flushgateway`: (bool, optional): true if you flush default route (gateway).
 * `delroutes`: (object, optional): list of routes add to the container namespace. Each route is a dictionary with "dst" and optional "gw" fields. If "gw" is omitted, value of "gateway" will be used.
 * `addroutes`: (object, optional): list of routes add to the container namespace. Each route is a dictionary with "dst" and optional "gw" fields. If "gw" is omitted, value of "gateway" will be used.
+* `debug`: (bool, optional): true if print debug log.
+* `extInf`: (string slice, optional): Routing operations are extended to additional interfaces, by default only the interfaces used by the upstream plugin, eg: ["eth0"]
 
