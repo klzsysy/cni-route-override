@@ -21,6 +21,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
+	"slices"
+	"sort"
+
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
@@ -28,9 +32,6 @@ import (
 	"github.com/containernetworking/plugins/pkg/ns"
 	log "github.com/k8snetworkplumbingwg/cni-log"
 	"github.com/vishvananda/netlink"
-	"net"
-	"slices"
-	"sort"
 )
 
 func init() {
@@ -54,14 +55,14 @@ var infNames []string
 type RouteOverrideConfig struct {
 	types.NetConf
 
-	PrevResult   *current.Result `json:"-"`
-	Debug        bool            `json:"debug,omitempty"`
-	ExtInf       []string        `json:"extInf,omitempty"`
-	FlushRoutes  bool            `json:"flushroutes,omitempty"`
-	FlushGateway bool            `json:"flushgateway,omitempty"`
-	DelRoutes    []*types.Route  `json:"delroutes"`
-	AddRoutes    []*types.Route  `json:"addroutes"`
-	SkipCheck    bool            `json:"skipcheck,omitempty"`
+	PrevResult        *current.Result `json:"-"`
+	Debug             bool            `json:"debug,omitempty"`
+	ExternalInterface []string        `json:"externalinterface,omitempty"`
+	FlushRoutes       bool            `json:"flushroutes,omitempty"`
+	FlushGateway      bool            `json:"flushgateway,omitempty"`
+	DelRoutes         []*types.Route  `json:"delroutes"`
+	AddRoutes         []*types.Route  `json:"addroutes"`
+	SkipCheck         bool            `json:"skipcheck,omitempty"`
 
 	Args *struct {
 		A *IPAMArgs `json:"cni"`
@@ -123,9 +124,9 @@ func parseConf(data []byte, _ string) (*RouteOverrideConfig, error) {
 	body, _ := json.Marshal(conf)
 	log.Debugf("parsed configuration: %s", string(body))
 
-	if conf.ExtInf != nil {
-		log.Debugf("Extension processing interface: %s", conf.ExtInf)
-		extInf = conf.ExtInf
+	if conf.ExternalInterface != nil {
+		log.Debugf("Extension processing interface: %s", conf.ExternalInterface)
+		extInf = conf.ExternalInterface
 	}
 
 	// Parse previous result
