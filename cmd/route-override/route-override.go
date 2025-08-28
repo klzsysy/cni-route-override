@@ -85,7 +85,6 @@ type IPAMArgs struct {
 	}
 */
 func parseConf(data []byte, _ string) (*RouteOverrideConfig, error) {
-	log.Debugf("Parsing configuration: %s", string(data))
 	conf := RouteOverrideConfig{FlushRoutes: false}
 
 	if err := json.Unmarshal(data, &conf); err != nil {
@@ -291,6 +290,7 @@ func addRoute(route *types.Route, result *current.Result) error {
 			Scope:     netlink.SCOPE_UNIVERSE,
 			Dst:       &route.Dst,
 			Gw:        route.GW,
+			Priority:  route.Priority,
 		})
 		if err == nil {
 			log.Infof("added route %v by %s", route, inf)
@@ -484,5 +484,5 @@ func cmdCheck(args *skel.CmdArgs) error {
 }
 
 func main() {
-	skel.PluginMainFuncs(skel.CNIFuncs{Add: cmdAdd, Check: cmdCheck, Del: cmdDel}, version.All, "route-override v1.0.0-dev")
+	skel.PluginMainFuncs(skel.CNIFuncs{Add: cmdAdd, Check: cmdCheck, Del: cmdDel}, version.All, "route-override v0.1.0-dev")
 }
