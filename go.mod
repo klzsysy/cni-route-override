@@ -10,6 +10,7 @@ require (
 	github.com/k8snetworkplumbingwg/cni-log v0.0.0-20250427123119-4a67e3a23f82
 	github.com/onsi/ginkgo v1.16.4
 	github.com/onsi/gomega v1.33.1
+	github.com/pkg/errors v0.9.1
 	github.com/vishvananda/netlink v1.0.0
 )
 

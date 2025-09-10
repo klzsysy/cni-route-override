@@ -24,6 +24,8 @@ import (
 	"net"
 	"slices"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -31,8 +33,11 @@ import (
 	"github.com/containernetworking/cni/pkg/version"
 	"github.com/containernetworking/plugins/pkg/ns"
 	log "github.com/k8snetworkplumbingwg/cni-log"
+	"github.com/pkg/errors"
 	"github.com/vishvananda/netlink"
 )
+
+const routeExisted = "file exists"
 
 func init() {
 	log.SetLogFile("/var/log/cni-route-override.log")
@@ -84,7 +89,7 @@ type IPAMArgs struct {
 		types.CommonArgs
 	}
 */
-func parseConf(data []byte, _ string) (*RouteOverrideConfig, error) {
+func parseConf(data []byte, args string) (*RouteOverrideConfig, error) {
 	conf := RouteOverrideConfig{FlushRoutes: false}
 
 	if err := json.Unmarshal(data, &conf); err != nil {
@@ -120,8 +125,9 @@ func parseConf(data []byte, _ string) (*RouteOverrideConfig, error) {
 	if conf.Debug {
 		log.SetLogLevel(log.DebugLevel)
 	}
+	setLogContext(conf.Name, args)
 	body, _ := json.Marshal(conf)
-	log.Debugf("parsed configuration: %s", string(body))
+	log.Infof("parsed configuration: %s", string(body))
 
 	if conf.ExternalInterface != nil {
 		log.Debugf("Extension processing interface: %s", conf.ExternalInterface)
@@ -215,7 +221,7 @@ func ifNames(res *current.Result) (infs []string) {
 	}
 	defer func() {
 		infNames = infs
-		log.Debugf("interface names: %s", infNames)
+		log.Infof("interface names: %s", infNames)
 	}()
 	if res.Interfaces != nil {
 		for _, netif := range res.Interfaces {
@@ -276,13 +282,13 @@ func deleteRoute(route *types.Route, res *current.Result) error {
 
 func addRoute(route *types.Route, result *current.Result) error {
 	var (
-		err   error
-		netif netlink.Link
+		resultErr []string
 	)
 	for _, inf := range ifNames(result) {
-		netif, err = netlink.LinkByName(inf)
+		log.Debugf("try add route %s by %s", route.String(), inf)
+		netif, err := netlink.LinkByName(inf)
 		if err != nil {
-			log.Errorf("failed to link by name %s: %v", inf, err)
+			resultErr = append(resultErr, log.Errorf("failed to link by name %s: %v", inf, err).Error())
 			continue
 		}
 		err = netlink.RouteAdd(&netlink.Route{
@@ -295,9 +301,42 @@ func addRoute(route *types.Route, result *current.Result) error {
 		if err == nil {
 			log.Infof("added route %v by %s", route, inf)
 			return nil
+		} else if err.Error() == routeExisted {
+			log.Debugf("the route %s you are trying to add already exists. Check whether it can be skipped.", route.String())
+			if exist, err1 := existedRoute(route); exist {
+				log.Infof("skip add route because the route already exists: %s", route.String())
+				return nil
+			} else if err1 != nil {
+				resultErr = append(resultErr, errors.Wrapf(err, "failed to add route %s by %s: %s", route.String(), inf, err1.Error()).Error())
+			} else {
+				resultErr = append(resultErr, fmt.Sprintf("cannot add route %s via %s by %s because a conflict already exists", route.Dst.String(), route.GW.String(), inf))
+				break
+			}
+		} else {
+			resultErr = append(resultErr, errors.Wrapf(err, "failed to add route %s by %s", route.String(), inf).Error())
 		}
 	}
-	return err
+	return errors.New(strings.Join(resultErr, "; "))
+}
+
+func existedRoute(dst *types.Route) (bool, error) {
+	routeFilter := &netlink.Route{
+		Dst: &dst.Dst,
+		Gw:  dst.GW,
+	}
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, routeFilter, netlink.RT_FILTER_DST|netlink.RT_FILTER_GW)
+	if err != nil {
+		return false, log.Errorf("failed to list route %s: %v", dst.Dst.String(), err)
+	}
+	if len(routes) == 0 {
+		return false, log.Errorf("failed to list existed routes %s: filter list is empty", dst.Dst.String())
+	}
+	for _, route := range routes {
+		if dst.Dst.String() == route.Dst.String() && dst.GW.Equal(route.Gw) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func processRoutes(netnsname string, conf *RouteOverrideConfig) (*current.Result, error) {
@@ -354,8 +393,8 @@ func processRoutes(netnsname string, conf *RouteOverrideConfig) (*current.Result
 		}
 		// Add route
 		for _, route := range conf.AddRoutes {
-			if err = addRoute(route, res); err != nil {
-				return log.Errorf("failed to add route %+v: %v", route, err)
+			if err := addRoute(route, res); err != nil {
+				return log.Errorf(err.Error())
 			}
 			newRoutes[route.String()] = route
 		}
@@ -479,10 +518,41 @@ func cmdCheck(args *skel.CmdArgs) error {
 		}
 		return nil
 	})
-
 	return err
 }
 
+type defaultPrefixer struct {
+	prefixFormat string
+	timeFormat   string
+}
+
+func (p *defaultPrefixer) CreatePrefix(loggingLevel log.Level) string {
+	return fmt.Sprintf(p.prefixFormat, time.Now().Format(p.timeFormat), loggingLevel)
+}
+
+func setLogContext(ifName, args string) {
+	prefixer := &defaultPrefixer{
+		prefixFormat: fmt.Sprintf("%%s [%%s] route-override [%s] [%s]: ", getPodKeys(args), ifName),
+		timeFormat:   time.RFC3339Nano,
+	}
+	log.SetPrefixer(prefixer)
+}
+
+func getPodKeys(args string) string {
+	var (
+		namespace string
+		name      string
+	)
+	for _, para := range strings.Split(args, ";") {
+		if strings.HasPrefix(para, "K8S_POD_NAME=") {
+			name = strings.TrimPrefix(para, "K8S_POD_NAME=")
+		} else if strings.HasPrefix(para, "K8S_POD_NAMESPACE=") {
+			namespace = strings.TrimPrefix(para, "K8S_POD_NAMESPACE=")
+		}
+	}
+	return namespace + "/" + name
+}
+
 func main() {
-	skel.PluginMainFuncs(skel.CNIFuncs{Add: cmdAdd, Check: cmdCheck, Del: cmdDel}, version.All, "route-override v0.1.0-dev")
+	skel.PluginMainFuncs(skel.CNIFuncs{Add: cmdAdd, Check: cmdCheck, Del: cmdDel}, version.All, "route-override v0.1.0")
 }

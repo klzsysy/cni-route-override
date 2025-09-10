@@ -14,8 +14,7 @@ It is useful in a case with [network-attachment-definition](https://github.com/K
 Installing using the provided daemonset will copy the `route-override` binary to the `/opt/cni/bin` on each machine in your Kubernetes cluster.
 
 ```
-git clone https://github.com/redhat-nfvpe/cni-route-override.git && cd cni-route-override/
-kubectl create -f deployments/daemonset-install.yaml
+kubectl create -f https://raw.githubusercontent.com/klzsysy/cni-route-override/refs/heads/master/deployments/daemonset-install.yaml
 ```
 
 ## Example Configuration

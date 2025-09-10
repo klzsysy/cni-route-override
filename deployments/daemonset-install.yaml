@@ -33,7 +33,7 @@ spec:
             - "cp -f /route-override /host/opt/cni/bin/; sleep 1000000000000"
           resources:
             requests:
-              cpu: "100m"
+              cpu: "10m"
               memory: "50Mi"
             limits:
               cpu: "100m"
